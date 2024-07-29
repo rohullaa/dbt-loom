@@ -24,3 +24,5 @@ reports/sources/*.csv
 .meltano
 .DS_Store
 .ruff_cache
+
+dbt/
