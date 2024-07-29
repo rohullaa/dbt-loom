@@ -33,6 +33,7 @@ class LoomModelNodeArgs(ModelNodeArgs):
 
     resource_type: NodeType = NodeType.Model
     group: Optional[str] = None
+    _unique_id: str = ""
 
     def __init__(self, **kwargs):
         super().__init__(
@@ -44,14 +45,21 @@ class LoomModelNodeArgs(ModelNodeArgs):
         )
         self.resource_type = kwargs.get("resource_type", NodeType.Model)
         self.group = kwargs.get("group")
+        self._unique_id = self._generate_unique_id()
 
-    @property
-    def unique_id(self) -> str:
+    def _generate_unique_id(self) -> str:
         unique_id = f"{self.resource_type}.{self.package_name}.{self.name}"
         if self.version:
             unique_id = f"{unique_id}.v{self.version}"
-
         return unique_id
+
+    @property
+    def unique_id(self) -> str:
+        return self._unique_id
+
+    @unique_id.setter
+    def unique_id(self, value: str):
+        self._unique_id = value
 
 
 def identify_node_subgraph(manifest) -> Dict[str, ManifestNode]:
@@ -235,6 +243,8 @@ class dbtLoom(dbtPlugin):
         if self.models != {} or not self.config:
             return
 
+        _updated_manifest_references = {}
+
         for manifest_reference in self.config.manifests:
             fire_event(
                 msg=f"dbt-loom: Loading manifest for `{manifest_reference.name}`"
@@ -245,9 +255,75 @@ class dbtLoom(dbtPlugin):
             if manifest is None:
                 continue
 
+            _project_name = manifest.get("metadata", {}).get("project_name")
+
+            if _project_name != manifest_reference.name:
+                _updated_manifest_references[_project_name] = manifest_reference.name
+
             self.manifests[manifest_reference.name] = manifest
 
             selected_nodes = identify_node_subgraph(manifest)
+            _fire_event = False
+
+            keys_to_update = []
+
+            for key, value in selected_nodes.items():
+                if (
+                    value.package_name == _project_name
+                    and manifest_reference.name != _project_name
+                ):
+                    if not _fire_event:
+                        fire_event(
+                            msg=f"dbt-loom: Changing package name from `{value.package_name}` to `{manifest_reference.name}`"
+                        )
+                        _fire_event = True
+
+                    new_key = key.replace(_project_name, manifest_reference.name)
+                    keys_to_update.append((key, new_key))
+
+                    value.package_name = manifest_reference.name
+                    value.depends_on_nodes = [
+                        node.replace(_project_name, manifest_reference.name)
+                        for node in value.depends_on_nodes
+                    ]
+
+                if value.package_name in _updated_manifest_references.keys():
+                    new_key = key.replace(
+                        value.package_name,
+                        _updated_manifest_references[value.package_name],
+                    )
+                    keys_to_update.append((key, new_key))
+
+                    value.package_name = _updated_manifest_references[
+                        value.package_name
+                    ]
+                    value.depends_on_nodes = [
+                        node.replace(
+                            value.package_name,
+                            _updated_manifest_references[value.package_name],
+                        )
+                        for node in value.depends_on_nodes
+                    ]
+
+                if value.depends_on_nodes:
+                    for node in value.depends_on_nodes:
+                        _manifest_name = node.split(".")[1]
+                        if _manifest_name in _updated_manifest_references.keys():
+                            new_node = node.replace(
+                                _manifest_name,
+                                _updated_manifest_references[_manifest_name],
+                            )
+                            value.depends_on_nodes = [
+                                new_node if _node == node else _node
+                                for _node in value.depends_on_nodes
+                            ]
+
+            for old_key, new_key in keys_to_update:
+                selected_nodes[new_key] = selected_nodes.pop(old_key)
+                assert (
+                    old_key not in selected_nodes
+                ), f"Key {old_key} still exists in selected_nodes"
+
             self.models.update(convert_model_nodes_to_model_node_args(selected_nodes))
 
     @dbt_hook
